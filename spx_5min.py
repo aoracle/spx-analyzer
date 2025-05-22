@@ -22,6 +22,8 @@ from scipy.signal import argrelextrema
 from scipy.signal import savgol_filter
 import sys
 import pdb
+import requests
+import streamlit as st
 
 # Initialize colorama
 init()
@@ -99,71 +101,151 @@ class SPX5MinCandleAnalyzer:
             'TRIPLE BOTTOM': ('TB', True)
         }
 
+    def fetch_historical_ohlc_data(self, root, start_date, end_date, interval_ms, api_key):
+        """Fetches historical OHLC data from Thetadata REST API."""
+        base_url = "https://api.thetadata.us/v2/indices/ohlc"
+        params = {
+            'root': root,
+            'start_date': start_date,
+            'end_date': end_date,
+            'ivl': interval_ms,
+            'api_key': api_key,
+            'use_csv': 'false', # Requesting JSON for easier parsing
+            'pretty_time': 'false'
+        }
+        
+        try:
+            response = requests.get(base_url, params=params)
+            response.raise_for_status() # Raise an exception for bad status codes
+            data = response.json()
+            
+            if data and data['response']:
+                # Extract data and format
+                ohlc_data = data['response']
+                columns = data['header']['format'] # Get column names from header
+                df = pd.DataFrame(ohlc_data, columns=columns)
+                
+                # Convert ms_of_day and date to timestamp
+                # ms_of_day is milliseconds since midnight ET
+                # date is YYYYMMDD
+                df['timestamp'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d') + pd.to_timedelta(df['ms_of_day'], unit='ms')
+                
+                # Drop original date and ms_of_day columns
+                df = df.drop(columns=['ms_of_day', 'date'])
+                
+                return df
+            else:
+                print(f"{Fore.YELLOW}Thetadata API returned no data for {root} from {start_date} to {end_date}{Style.RESET_ALL}")
+                return pd.DataFrame()
+                
+        except requests.exceptions.RequestException as e:
+            print(f"{Fore.RED}Error fetching data from Thetadata API: {e}{Style.RESET_ALL}")
+            if self.debug:
+                traceback.print_exc()
+            return pd.DataFrame()
+
     def load_historical_data(self, target_date=None):
         """Load and process historical data"""
         try:
-            # Get current date in ET
-            today = datetime.now(self.est)
-            if target_date:
-                # If target_date is provided, use it as the reference date
-                today = datetime.strptime(target_date, '%Y%m%d').replace(tzinfo=self.est)
-            data = []
-            
-            # Convert month number to month name
-            month_map = {
-                '01': 'JAN', '02': 'FEB', '03': 'MAR', '04': 'APR',
-                '05': 'MAY', '06': 'JUN', '07': 'JUL', '08': 'AUG',
-                '09': 'SEP', '10': 'OCT', '11': 'NOV', '12': 'DEC'
-            }
-            
-            # Load last 40 trading days to ensure we get previous month data
-            for i in range(40):
-                check_date = today - timedelta(days=i)
-                if check_date.weekday() >= 5:  # Skip weekends
-                    continue
+            # Check if running on Streamlit Cloud (environment variable set by Streamlit)
+            is_streamlit_cloud = os.environ.get('STREAMLIT_CLOUD', 'false').lower() == 'true'
+
+            if is_streamlit_cloud:
+                if 'THETADATA_API_KEY' not in st.secrets:
+                    st.error("Thetadata API key not found in Streamlit secrets.")
+                    print(f"{Fore.RED}Thetadata API key not found in Streamlit secrets.{Style.RESET_ALL}")
+                    return
                     
-                date_str = check_date.strftime('%Y%m%d')
-                year = date_str[:4]
-                month_num = date_str[4:6]
-                month = month_map[month_num]
+                api_key = st.secrets['THETADATA_API_KEY']
+                root_symbol = 'SPX' # Or whatever the correct root is for SPX indices
+                # Determine the date range to fetch
+                # For historical view, let's fetch the last 40 days for now, similar to local loading
+                today = datetime.now(self.est)
+                if target_date:
+                     today = datetime.strptime(target_date, '%Y%m%d').replace(tzinfo=self.est)
+
+                # Fetch data for the last 40 days
+                all_data = []
+                for i in range(40):
+                    check_date = today - timedelta(days=i)
+                    date_str = check_date.strftime('%Y%m%d')
+                    
+                    # ThetaData API might return data even for weekends if available, fetch day by day
+                    day_df = self.fetch_historical_ohlc_data(
+                        root=root_symbol,
+                        start_date=date_str,
+                        end_date=date_str,
+                        interval_ms=300000, # 5 minutes
+                        api_key=api_key
+                    )
+                    if not day_df.empty:
+                        all_data.append(day_df)
                 
-                file_path = self.data_dir / year / month / f"spx_{date_str[6:8]}{month_num}{date_str[2:4]}.csv"
+                if all_data:
+                    self.historical_data = pd.concat(all_data, ignore_index=True)
+                    self.historical_data = self.historical_data.sort_values('timestamp').reset_index(drop=True)
+                    # Resample is not needed if API returns 5-minute intervals directly
+                    print(f"{Fore.GREEN}Loaded historical data from Thetadata REST API successfully{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.RED}No historical data found from Thetadata REST API{Style.RESET_ALL}")
                 
-                if file_path.exists():
-                    try:
-                        day_data = pd.read_csv(file_path)
-                        day_data = day_data[
-                            (day_data['open'] > 0) &
-                            (day_data['high'] > 0) &
-                            (day_data['low'] > 0) &
-                            (day_data['close'] > 0)
-                        ]
-                        day_data['date'] = date_str
-                        data.append(day_data)
-                        if self.debug:
-                            print(f"Loaded data from {file_path}")
-                    except Exception as e:
-                        if self.debug:
-                            print(f"Error loading {file_path}: {str(e)}")
-                        continue
-            
-            if data:
-                # Convert 1-minute data to 5-minute data
-                self.historical_data = pd.concat(data, ignore_index=True)
-                self.historical_data['timestamp'] = pd.to_datetime(self.historical_data['timestamp'])
-                
-                # Resample to 5-minute candles
-                self.historical_data = self.historical_data.resample('5T', on='timestamp').agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'date': 'first'
-                }).reset_index()
-                
-                print(f"{Fore.GREEN}Loaded and converted historical data to 5-minute candles successfully{Style.RESET_ALL}")
             else:
-                print(f"{Fore.RED}No historical data found{Style.RESET_ALL}")
+                # Existing local file loading logic
+                data = []
+                
+                # Convert month number to month name
+                month_map = {
+                    '01': 'JAN', '02': 'FEB', '03': 'MAR', '04': 'APR',
+                    '05': 'MAY', '06': 'JUN', '07': 'JUL', '08': 'AUG',
+                    '09': 'SEP', '10': 'OCT', '11': 'NOV', '12': 'DEC'
+                }
+                
+                # Load last 40 trading days to ensure we get previous month data
+                today = datetime.now(self.est)
+                if target_date:
+                    # If target_date is provided, use it as the reference date
+                    today = datetime.strptime(target_date, '%Y%m%d').replace(tzinfo=self.est)
+
+                for i in range(40):
+                    check_date = today - timedelta(days=i)
+                    if check_date.weekday() >= 5:  # Skip weekends
+                        continue
+                        
+                    date_str = check_date.strftime('%Y%m%d')
+                    year = date_str[:4]
+                    month_num = date_str[4:6]
+                    month = month_map[month_num]
+                    
+                    file_path = self.data_dir / year / month / f"spx_{date_str[6:8]}{month_num}{date_str[2:4]}.csv"
+                    
+                    if file_path.exists():
+                        try:
+                            # Assuming local files are already in 5-minute format
+                            day_data = pd.read_csv(file_path)
+                            day_data = day_data[
+                                (day_data['open'] > 0) &
+                                (day_data['high'] > 0) &
+                                (day_data['low'] > 0) &
+                                (day_data['close'] > 0)
+                            ]
+                            day_data['date'] = date_str
+                            data.append(day_data)
+                            if self.debug:
+                                print(f"Loaded data from {file_path}")
+                        except Exception as e:
+                            if self.debug:
+                                print(f"Error loading {file_path}: {str(e)}")
+                            continue
+                
+                if data:
+                    self.historical_data = pd.concat(data, ignore_index=True)
+                    self.historical_data['timestamp'] = pd.to_datetime(self.historical_data['timestamp'])
+                    # Sort and reset index
+                    self.historical_data = self.historical_data.sort_values('timestamp').reset_index(drop=True)
+                    
+                    print(f"{Fore.GREEN}Loaded historical data from local files successfully{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.RED}No historical data found from local files{Style.RESET_ALL}")
                 
         except Exception as e:
             print(f"{Fore.RED}Error loading historical data: {e}{Style.RESET_ALL}")
@@ -1326,6 +1408,7 @@ class SPX5MinCandleAnalyzer:
         if 'Low' in df.columns:
             styled = styled.apply(lambda col: [highlight_low(v, df['Low']) for v in col], subset=['Low'])
         return styled
+
 def main():
     print("\nSelect Mode:")
     print("1. Live Mode (Real-time updates)")
